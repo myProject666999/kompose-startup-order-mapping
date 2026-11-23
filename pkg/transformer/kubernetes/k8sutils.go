@@ -626,8 +626,23 @@ func (k *Kubernetes) UpdateKubernetesObjects(name string, service kobject.Servic
 		template.Spec.Affinity = ConfigAffinity(service)
 		template.Spec.TopologySpreadConstraints = ConfigTopologySpreadConstraints(service)
 		// Configure the HealthCheck
-		template.Spec.Containers[0].LivenessProbe = configProbe(service.HealthChecks.Liveness)
-		template.Spec.Containers[0].ReadinessProbe = configProbe(service.HealthChecks.Readiness)
+		livenessProbe, err := configProbe(name, service.HealthChecks.Liveness)
+		if err != nil {
+			return err
+		}
+		readinessProbe, err := configProbe(name, service.HealthChecks.Readiness)
+		if err != nil {
+			return err
+		}
+		startupProbe := configStartupProbe(service.HealthChecks.Liveness)
+		if startupProbe != nil && livenessProbe != nil {
+			// the startup probe covers the start period, no need to
+			// delay the liveness probe as well
+			livenessProbe.InitialDelaySeconds = 0
+		}
+		template.Spec.Containers[0].LivenessProbe = livenessProbe
+		template.Spec.Containers[0].ReadinessProbe = readinessProbe
+		template.Spec.Containers[0].StartupProbe = startupProbe
 
 		if service.StopGracePeriod != "" {
 			template.Spec.TerminationGracePeriodSeconds, err = DurationStrToSecondsInt(service.StopGracePeriod)
@@ -745,6 +760,7 @@ func (k *Kubernetes) UpdateKubernetesObjects(name string, service kobject.Servic
 			template.Spec.ServiceAccountName = serviceAccountName
 		}
 		fillInitContainers(template, service)
+		fillDependsOnInitContainers(template, service)
 		return nil
 	}
 

@@ -881,6 +881,14 @@ func TestHealthCheckOnMultipleContainers(t *testing.T) {
 		}
 	}
 
+	mustConfigProbe := func(healthCheck kobject.HealthCheck) *api.Probe {
+		probe, err := configProbe("app", healthCheck)
+		if err != nil {
+			t.Fatalf("configProbe failed: %v", err)
+		}
+		return probe
+	}
+
 	createConfig := func(name string, livenessTCPPort, readinessTCPPort int32) kobject.ServiceConfig {
 		config := newSimpleServiceConfig()
 		config.Labels = map[string]string{compose.LabelServiceGroup: groupName}
@@ -906,12 +914,12 @@ func TestHealthCheckOnMultipleContainers(t *testing.T) {
 			kobject.ConvertOptions{ServiceGroupMode: "label", CreateD: true},
 			map[string]api.Container{
 				"app1": {
-					LivenessProbe:  configProbe(createHealthCheck(8081)),
-					ReadinessProbe: configProbe(createHealthCheck(9091)),
+					LivenessProbe:  mustConfigProbe(createHealthCheck(8081)),
+					ReadinessProbe: mustConfigProbe(createHealthCheck(9091)),
 				},
 				"app2": {
-					LivenessProbe:  configProbe(createHealthCheck(8082)),
-					ReadinessProbe: configProbe(createHealthCheck(9092)),
+					LivenessProbe:  mustConfigProbe(createHealthCheck(8082)),
+					ReadinessProbe: mustConfigProbe(createHealthCheck(9092)),
 				},
 			},
 		},

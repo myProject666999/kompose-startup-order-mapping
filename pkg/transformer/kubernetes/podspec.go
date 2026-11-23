@@ -37,6 +37,23 @@ func AddContainer(service kobject.ServiceConfig, opt kobject.ConvertOptions) Pod
 			panic("Unable to load env variables")
 		}
 
+		// PodSpecOption cannot return an error, so a broken probe
+		// configuration is reported here and the probe is skipped.
+		livenessProbe, err := configProbe(service.Name, service.HealthChecks.Liveness)
+		if err != nil {
+			log.Warnf("Unable to configure liveness probe: %v", err)
+		}
+		readinessProbe, err := configProbe(service.Name, service.HealthChecks.Readiness)
+		if err != nil {
+			log.Warnf("Unable to configure readiness probe: %v", err)
+		}
+		startupProbe := configStartupProbe(service.HealthChecks.Liveness)
+		if startupProbe != nil && livenessProbe != nil {
+			// the startup probe covers the start period, no need to
+			// delay the liveness probe as well
+			livenessProbe.InitialDelaySeconds = 0
+		}
+
 		podSpec.Containers = append(podSpec.Containers, api.Container{
 			Name:           name,
 			Image:          image,
@@ -47,8 +64,9 @@ func AddContainer(service kobject.ServiceConfig, opt kobject.ConvertOptions) Pod
 			WorkingDir:     service.WorkingDir,
 			Stdin:          service.Stdin,
 			TTY:            service.Tty,
-			LivenessProbe:  configProbe(service.HealthChecks.Liveness),
-			ReadinessProbe: configProbe(service.HealthChecks.Readiness),
+			LivenessProbe:  livenessProbe,
+			ReadinessProbe: readinessProbe,
+			StartupProbe:   startupProbe,
 		})
 		if service.ImagePullSecret != "" {
 			podSpec.ImagePullSecrets = append(podSpec.ImagePullSecrets, api.LocalObjectReference{
@@ -305,11 +323,14 @@ func DomainName(service kobject.ServiceConfig) PodSpecOption {
 	}
 }
 
-func configProbe(healthCheck kobject.HealthCheck) *api.Probe {
+// configProbe builds a Kubernetes probe from a health check. It returns an
+// error instead of panicking when the health check has no usable probe
+// definition, so the caller can report it with the service name.
+func configProbe(name string, healthCheck kobject.HealthCheck) (*api.Probe, error) {
 	probe := api.Probe{}
 	// We check to see if it's blank or disable
 	if reflect.DeepEqual(healthCheck, kobject.HealthCheck{}) || healthCheck.Disable {
-		return nil
+		return nil, nil
 	}
 
 	if len(healthCheck.Test) > 0 {
@@ -332,7 +353,7 @@ func configProbe(healthCheck kobject.HealthCheck) *api.Probe {
 			},
 		}
 	} else {
-		panic(errors.New("Health check must contain a command"))
+		return nil, errors.Errorf("health check for service %s must contain a command, an http_get or a tcp_port probe", name)
 	}
 
 	probe.TimeoutSeconds = healthCheck.Timeout
@@ -342,7 +363,42 @@ func configProbe(healthCheck kobject.HealthCheck) *api.Probe {
 	// See issue: https://github.com/docker/cli/issues/116
 	// StartPeriod has been added to v3.4 of the compose
 	probe.InitialDelaySeconds = healthCheck.StartPeriod
-	return &probe
+	return &probe, nil
+}
+
+// configStartupProbe builds a startup probe from the health check's
+// StartPeriod. Docker's start_period tolerates failures while the container
+// starts up, which matches a Kubernetes startup probe much closer than the
+// legacy mapping to the liveness probe's initialDelaySeconds (during which no
+// probing happens at all). It returns nil when no startup probe should be
+// generated.
+func configStartupProbe(healthCheck kobject.HealthCheck) *api.Probe {
+	if healthCheck.StartPeriod <= 0 || healthCheck.Disable || healthCheck.DisableStartupProbe {
+		return nil
+	}
+
+	probe, err := configProbe("", healthCheck)
+	if err != nil || probe == nil {
+		// no usable probe handler; the liveness probe reports the error
+		return nil
+	}
+
+	period := healthCheck.Interval
+	if period <= 0 {
+		period = 10 // the Kubernetes default for periodSeconds
+	}
+	failureThreshold := healthCheck.StartPeriod / period
+	if healthCheck.StartPeriod%period != 0 {
+		failureThreshold++
+	}
+	if failureThreshold < 1 {
+		failureThreshold = 1
+	}
+
+	probe.InitialDelaySeconds = 0
+	probe.PeriodSeconds = period
+	probe.FailureThreshold = failureThreshold
+	return probe
 }
 
 // ServiceAccountName is responsible for setting the service account name to the pod spec

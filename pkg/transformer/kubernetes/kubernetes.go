@@ -1688,19 +1688,37 @@ func (k *Kubernetes) Transform(komposeObject kobject.KomposeObject, opt kobject.
 			return nil, err
 		}
 
+		// Generate the wait init containers approximating depends_on. This is
+		// computed here (not in the loader) because it needs to know whether
+		// the depended-on services expose ports.
+		service.DependsOnInitContainers = buildDependsOnInitContainers(service, komposeObject.ServiceConfigs)
+
 		// Generate pod or cronjob and configmap objects
 		if (service.Restart == "no" || service.Restart == "on-failure") && !opt.IsPodController() {
 			if service.CronJobSchedule != "" {
 				log.Infof("Create kubernetes pod instead of pod controller due to restart policy: %s", service.Restart)
-				cronJob := k.InitCJ(name, service, service.CronJobSchedule, service.CronJobConcurrencyPolicy, service.CronJobBackoffLimit)
+				backoffLimit := service.CronJobBackoffLimit
+				if backoffLimit == nil && service.RestartMaxRetries > 0 {
+					// the retry count of restart: on-failure:N only has a
+					// Kubernetes equivalent on Job-like workloads
+					retries := int32(service.RestartMaxRetries)
+					backoffLimit = &retries
+				}
+				cronJob := k.InitCJ(name, service, service.CronJobSchedule, service.CronJobConcurrencyPolicy, backoffLimit)
 				objects = append(objects, cronJob)
 			} else {
+				if service.RestartMaxRetries > 0 {
+					log.Warnf("restart retry count %d of service %s has no Kubernetes equivalent on a bare Pod - ignoring", service.RestartMaxRetries, name)
+				}
 				pod := k.InitPod(name, service)
 				objects = append(objects, pod)
 			}
 			envConfigMaps := k.PargeEnvFiletoConfigMaps(name, service, opt)
 			objects = append(objects, envConfigMaps...)
 		} else {
+			if service.RestartMaxRetries > 0 {
+				log.Warnf("restart retry count %d of service %s is only supported for cronjob workloads (mapped to backoffLimit) - ignoring", service.RestartMaxRetries, name)
+			}
 			objects = k.CreateWorkloadAndConfigMapObjects(name, service, opt)
 		}
 		if opt.Controller == StatefulStateController {

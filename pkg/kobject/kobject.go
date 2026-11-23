@@ -103,6 +103,25 @@ func (opt *ConvertOptions) IsPodController() bool {
 // ServiceConfigGroup holds an array of a ServiceConfig objects.
 type ServiceConfigGroup []ServiceConfig
 
+// ServiceDependency holds a single depends_on entry of a service.
+// Condition is one of the compose conditions: service_started,
+// service_healthy or service_completed_successfully.
+type ServiceDependency struct {
+	Name      string // normalized name of the depended-on service
+	Condition string
+	Required  bool
+	Restart   bool
+}
+
+// InitContainerConfig holds an init container generated during conversion
+// (e.g. a depends_on wait container), as opposed to one defined by the user
+// through kompose.init.containers.* labels.
+type InitContainerConfig struct {
+	Name    string
+	Image   string
+	Command []string
+}
+
 // ServiceConfig holds the basic struct of a container
 // which should not introduce any kubernetes specific struct
 type ServiceConfig struct {
@@ -179,6 +198,17 @@ type ServiceConfig struct {
 
 	WithKomposeAnnotation bool `compose:""`
 	InGroup               bool
+
+	// DependsOn holds the parsed depends_on entries of the service,
+	// sorted by dependency name for deterministic output.
+	DependsOn []ServiceDependency `compose:"depends_on"`
+	// RestartMaxRetries is the retry count parsed from a restart value of
+	// the form "on-failure:N". 0 means no explicit count was given.
+	RestartMaxRetries int `compose:""`
+	// DependsOnInitContainers holds the wait init containers generated from
+	// DependsOn during transformation. It is computed by the transformer,
+	// not loaded from the compose file.
+	DependsOnInitContainers []InitContainerConfig `compose:""`
 }
 
 // HealthChecks used to distinguish between liveness and readiness
@@ -197,9 +227,13 @@ type HealthCheck struct {
 	Retries     int32
 	StartPeriod int32
 	Disable     bool
-	HTTPPath    string
-	HTTPPort    int32
-	TCPPort     int32
+	// DisableStartupProbe restores the legacy behavior of mapping
+	// StartPeriod to the liveness probe's initialDelaySeconds instead of
+	// generating a startup probe.
+	DisableStartupProbe bool
+	HTTPPath            string
+	HTTPPort            int32
+	TCPPort             int32
 }
 
 // EnvVar holds the environment variable struct of a container

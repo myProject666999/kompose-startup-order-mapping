@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -59,7 +60,6 @@ func checkUnsupportedKey(composeProject *types.Project) []string {
 		"CPUSet":        false,
 		"CPUShares":     false,
 		"Devices":       false,
-		"DependsOn":     false,
 		"DNS":           false,
 		"DNSSearch":     false,
 		"EnvFile":       false,
@@ -395,6 +395,7 @@ func parseHealthCheck(composeHealthCheck types.HealthCheckConfig, labels types.L
 	var httpPort, tcpPort, timeout, interval, retries, startPeriod int32
 	var test []string
 	var httpPath string
+	var disable, disableStartupProbe bool
 
 	// Here we convert the timeout from 1h30s (example) to 36030 seconds.
 	if composeHealthCheck.Timeout != nil {
@@ -425,8 +426,30 @@ func parseHealthCheck(composeHealthCheck types.HealthCheckConfig, labels types.L
 		startPeriod = int32(parse.Seconds())
 	}
 
-	if composeHealthCheck.Test != nil {
-		test = composeHealthCheck.Test[1:]
+	// The first element of Test is a compose directive (NONE, CMD or
+	// CMD-SHELL), not part of the command, and each of them needs different
+	// handling. An empty test list means no command at all.
+	if len(composeHealthCheck.Test) > 0 {
+		directive := composeHealthCheck.Test[0]
+		command := composeHealthCheck.Test[1:]
+		switch directive {
+		case "NONE":
+			// "NONE" disables the health check, there is no command to run
+			disable = true
+		case "CMD":
+			// CMD is exec form, the remaining elements are the argv
+			test = command
+		case "CMD-SHELL":
+			// CMD-SHELL hands the whole string to a shell. A Kubernetes exec
+			// probe runs the argv directly without a shell, so wrap it.
+			if len(command) > 0 {
+				test = []string{"sh", "-c", strings.Join(command, " ")}
+			}
+		default:
+			// compose-go already validates the directive is one of the above,
+			// this is only defensive for programmatically built configs
+			test = composeHealthCheck.Test
+		}
 	}
 
 	for key, value := range labels {
@@ -437,20 +460,98 @@ func parseHealthCheck(composeHealthCheck types.HealthCheckConfig, labels types.L
 			httpPort = cast.ToInt32(value)
 		case HealthCheckLivenessTCPPort:
 			tcpPort = cast.ToInt32(value)
+		case HealthCheckLivenessStartupProbeDisable:
+			disableStartupProbe = cast.ToBool(value)
 		}
 	}
 
-	// Due to docker/cli adding "CMD-SHELL" to the struct, we remove the first element of composeHealthCheck.Test
 	return kobject.HealthCheck{
-		Test:        test,
-		TCPPort:     tcpPort,
-		HTTPPath:    httpPath,
-		HTTPPort:    httpPort,
-		Timeout:     timeout,
-		Interval:    interval,
-		Retries:     retries,
-		StartPeriod: startPeriod,
+		Test:                test,
+		TCPPort:             tcpPort,
+		HTTPPath:            httpPath,
+		HTTPPort:            httpPort,
+		Timeout:             timeout,
+		Interval:            interval,
+		Retries:             retries,
+		StartPeriod:         startPeriod,
+		Disable:             disable,
+		DisableStartupProbe: disableStartupProbe,
 	}, nil
+}
+
+// parseRestartPolicy splits a compose restart value of the form "on-failure:N"
+// into the policy and the maximum retry count. It returns the policy and the
+// retry count (0 when no count was given).
+func parseRestartPolicy(restart string, name string) (string, int) {
+	policy, retries, found := strings.Cut(restart, ":")
+	if !found {
+		return restart, 0
+	}
+	if policy != "on-failure" {
+		log.Warnf("Restart policy %q in service %s is not supported, ignoring everything after ':'", restart, name)
+		return policy, 0
+	}
+	maxRetries, err := strconv.Atoi(retries)
+	if err != nil || maxRetries < 0 {
+		log.Warnf("Invalid restart retry count %q in service %s, ignoring it", retries, name)
+		return policy, 0
+	}
+	return policy, maxRetries
+}
+
+// parseDependsOn converts compose depends_on entries to a slice of
+// kobject.ServiceDependency sorted by dependency name, so that later stages
+// produce deterministic output.
+// compose-go already rejects dependencies on undefined services and
+// dependency cycles while loading the project, so they are not handled here.
+// compose-go also derives synthetic depends_on entries from links,
+// network_mode/ipc/pid/uts/cgroup "service:" references; those keys are
+// handled (or reported) separately by kompose, so the derived entries are
+// filtered out here.
+func parseDependsOn(composeServiceConfig *types.ServiceConfig, name string) []kobject.ServiceDependency {
+	dependsOn := composeServiceConfig.DependsOn
+	if len(dependsOn) == 0 {
+		return nil
+	}
+
+	// names of dependencies implicitly derived by compose-go from other keys
+	implicit := map[string]bool{}
+	for _, link := range composeServiceConfig.Links {
+		implicit[strings.Split(link, ":")[0]] = true
+	}
+	for _, value := range []string{composeServiceConfig.NetworkMode, composeServiceConfig.Ipc, composeServiceConfig.Pid, composeServiceConfig.Uts, composeServiceConfig.Cgroup} {
+		if strings.HasPrefix(value, types.ServicePrefix) {
+			implicit[strings.TrimPrefix(value, types.ServicePrefix)] = true
+		}
+	}
+
+	deps := make([]kobject.ServiceDependency, 0, len(dependsOn))
+	for depName, config := range dependsOn {
+		if implicit[depName] && config.Restart && config.Required &&
+			(config.Condition == "" || config.Condition == "service_started") {
+			// derived from links / namespace sharing, not an explicit
+			// depends_on entry
+			continue
+		}
+		condition := config.Condition
+		if condition == "" {
+			condition = "service_started"
+		}
+		if config.Restart {
+			log.Warnf("depends_on.restart for service %s on %s is not supported - ignoring", name, depName)
+		}
+		deps = append(deps, kobject.ServiceDependency{
+			Name:      normalizeServiceNames(depName),
+			Condition: condition,
+			Required:  config.Required,
+			Restart:   config.Restart,
+		})
+	}
+	if len(deps) == 0 {
+		return nil
+	}
+	sort.Slice(deps, func(i, j int) bool { return deps[i].Name < deps[j].Name })
+	return deps
 }
 
 func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.KomposeObject, error) {
@@ -503,7 +604,9 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 			return kobject.KomposeObject{}, err
 		}
 
-		serviceConfig.Restart = composeServiceConfig.Restart
+		serviceConfig.Restart, serviceConfig.RestartMaxRetries = parseRestartPolicy(composeServiceConfig.Restart, name)
+
+		serviceConfig.DependsOn = parseDependsOn(&composeServiceConfig, name)
 
 		if composeServiceConfig.Deploy != nil {
 			// Deploy keys
@@ -515,7 +618,18 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 			// restart-policy: deploy.restart_policy.condition will rewrite restart option
 			// see: https://docs.docker.com/compose/compose-file/#restart_policy
 			if composeServiceConfig.Deploy.RestartPolicy != nil {
-				serviceConfig.Restart = composeServiceConfig.Deploy.RestartPolicy.Condition
+				restartPolicy := composeServiceConfig.Deploy.RestartPolicy
+				serviceConfig.Restart = restartPolicy.Condition
+				serviceConfig.RestartMaxRetries = 0
+				if restartPolicy.MaxAttempts != nil {
+					log.Warnf("deploy.restart_policy.max_attempts in service %s is not supported - ignoring", name)
+				}
+				if restartPolicy.Delay != nil {
+					log.Warnf("deploy.restart_policy.delay in service %s is not supported - ignoring", name)
+				}
+				if restartPolicy.Window != nil {
+					log.Warnf("deploy.restart_policy.window in service %s is not supported - ignoring", name)
+				}
 			}
 
 			// replicas:

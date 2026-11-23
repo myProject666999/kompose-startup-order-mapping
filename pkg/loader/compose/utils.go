@@ -76,6 +76,19 @@ const (
 	HealthCheckLivenessHTTPGetPort = "kompose.service.healthcheck.liveness.http_get_port"
 	// HealthCheckLivenessTCPPort defines liveness health check tcp port
 	HealthCheckLivenessTCPPort = "kompose.service.healthcheck.liveness.tcp_port"
+	// HealthCheckLivenessStartupProbeDisable disables generating a startup probe
+	// from the healthcheck start_period and restores the legacy mapping of
+	// start_period to the liveness probe initialDelaySeconds
+	HealthCheckLivenessStartupProbeDisable = "kompose.service.healthcheck.liveness.startup_probe.disable"
+	// LabelDependsOnWait enables generating wait init containers for
+	// depends_on entries with condition service_started or service_healthy
+	LabelDependsOnWait = "kompose.depends-on.wait"
+	// LabelDependsOnWaitImage overrides the image used for generated
+	// depends_on wait init containers
+	LabelDependsOnWaitImage = "kompose.depends-on.wait-image"
+	// LabelDependsOnProbePorts maps depended-on service names to the TCP port
+	// the generated wait init container should probe, e.g. "db=5432,cache=6379"
+	LabelDependsOnProbePorts = "kompose.depends-on.probe-ports"
 	// ServiceTypeHeadless ...
 	ServiceTypeHeadless = "Headless"
 	// LabelSecurityContextFsGroup defines the pod FsGroup

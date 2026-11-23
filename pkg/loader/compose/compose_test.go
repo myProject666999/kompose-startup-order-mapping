@@ -49,20 +49,76 @@ func TestParseHealthCheck(t *testing.T) {
 		"Exec": {
 			input: input{
 				healthCheck: types.HealthCheckConfig{
-					Test:        []string{"CMD-SHELL", "echo", "foobar"},
+					Test:        []string{"CMD", "echo", "foobar"},
 					Timeout:     durationTypesPtr(1 * time.Second),
 					Interval:    durationTypesPtr(2 * time.Second),
 					Retries:     &helperValue,
 					StartPeriod: durationTypesPtr(3 * time.Second),
 				},
 			},
-			// CMD-SHELL or SHELL is included Test within docker/cli, thus we remove the first value in Test
+			// CMD is exec form, the directive itself is not part of the command
 			expected: kobject.HealthCheck{
 				Test:        []string{"echo", "foobar"},
 				Timeout:     1,
 				Interval:    2,
 				Retries:     2,
 				StartPeriod: 3,
+			},
+		},
+		"ExecShell": {
+			input: input{
+				healthCheck: types.HealthCheckConfig{
+					Test:        []string{"CMD-SHELL", "curl -f http://localhost || exit 1"},
+					Timeout:     durationTypesPtr(1 * time.Second),
+					Interval:    durationTypesPtr(2 * time.Second),
+					Retries:     &helperValue,
+					StartPeriod: durationTypesPtr(3 * time.Second),
+				},
+			},
+			// CMD-SHELL hands the whole string to a shell, so it is wrapped
+			// into sh -c for the exec probe to be able to run it
+			expected: kobject.HealthCheck{
+				Test:        []string{"sh", "-c", "curl -f http://localhost || exit 1"},
+				Timeout:     1,
+				Interval:    2,
+				Retries:     2,
+				StartPeriod: 3,
+			},
+		},
+		"None": {
+			input: input{
+				healthCheck: types.HealthCheckConfig{
+					Test: []string{"NONE"},
+				},
+			},
+			// NONE disables the health check
+			expected: kobject.HealthCheck{
+				Disable: true,
+			},
+		},
+		"EmptyTest": {
+			input: input{
+				healthCheck: types.HealthCheckConfig{
+					Test: []string{},
+				},
+			},
+			// an empty test list means no command, and must not panic
+			expected: kobject.HealthCheck{},
+		},
+		"StartupProbeDisable": {
+			input: input{
+				healthCheck: types.HealthCheckConfig{
+					Test:        []string{"CMD", "echo", "foobar"},
+					StartPeriod: durationTypesPtr(3 * time.Second),
+				},
+				labels: types.Labels{
+					"kompose.service.healthcheck.liveness.startup_probe.disable": "true",
+				},
+			},
+			expected: kobject.HealthCheck{
+				Test:                []string{"echo", "foobar"},
+				StartPeriod:         3,
+				DisableStartupProbe: true,
 			},
 		},
 		"HTTPGet": {
@@ -799,5 +855,200 @@ func Test_parseKomposeLabels(t *testing.T) {
 				t.Errorf("Name are not equal, expected: %v, output: %v", tt.expected.Name, tt.args.serviceConfig.Name)
 			}
 		})
+	}
+}
+
+func TestParseRestartPolicy(t *testing.T) {
+	testCases := map[string]struct {
+		restart            string
+		expectedPolicy     string
+		expectedMaxRetries int
+	}{
+		"empty":                         {"", "", 0},
+		"always":                        {"always", "always", 0},
+		"no":                            {"no", "no", 0},
+		"on-failure":                    {"on-failure", "on-failure", 0},
+		"on-failure with count":         {"on-failure:5", "on-failure", 5},
+		"on-failure with invalid count": {"on-failure:abc", "on-failure", 0},
+		"unless-stopped":                {"unless-stopped", "unless-stopped", 0},
+	}
+
+	for name, testCase := range testCases {
+		t.Log("Test case:", name)
+		policy, maxRetries := parseRestartPolicy(testCase.restart, "app")
+		if policy != testCase.expectedPolicy || maxRetries != testCase.expectedMaxRetries {
+			t.Errorf("Expected (%q, %d), got (%q, %d)", testCase.expectedPolicy, testCase.expectedMaxRetries, policy, maxRetries)
+		}
+	}
+}
+
+func TestParseDependsOn(t *testing.T) {
+	dependsOn := types.DependsOnConfig{
+		"db":     {Condition: "service_healthy", Required: true},
+		"cache":  {Condition: "service_started", Required: false},
+		"mig":    {Condition: "service_completed_successfully", Required: true},
+		"app_db": {Condition: "", Required: true},
+	}
+
+	deps := parseDependsOn(&types.ServiceConfig{DependsOn: dependsOn}, "app")
+
+	if len(deps) != 4 {
+		t.Fatalf("Expected 4 dependencies, got %d", len(deps))
+	}
+	// dependencies must be sorted by normalized name for deterministic output
+	expectedOrder := []string{"app-db", "cache", "db", "mig"}
+	for i, expected := range expectedOrder {
+		if deps[i].Name != expected {
+			t.Errorf("Expected dependency %d to be %q, got %q", i, expected, deps[i].Name)
+		}
+	}
+	// an empty condition defaults to service_started
+	if deps[0].Condition != "service_started" {
+		t.Errorf("Expected default condition service_started, got %q", deps[0].Condition)
+	}
+	if deps[1].Required {
+		t.Errorf("Expected cache dependency to be optional")
+	}
+}
+
+func TestParseDependsOnFiltersImplicitEntries(t *testing.T) {
+	// compose-go derives depends_on entries from links and
+	// network_mode/ipc/pid "service:" references; those must be filtered out
+	dependsOn := types.DependsOnConfig{
+		"redis":   {Condition: "service_started", Required: true, Restart: true},
+		"sidecar": {Condition: "service_started", Required: true, Restart: true},
+		"db":      {Condition: "service_healthy", Required: true},
+	}
+	composeServiceConfig := &types.ServiceConfig{
+		DependsOn:   dependsOn,
+		Links:       []string{"redis"},
+		NetworkMode: "service:sidecar",
+	}
+
+	deps := parseDependsOn(composeServiceConfig, "app")
+
+	if len(deps) != 1 || deps[0].Name != "db" {
+		t.Errorf("Expected only the explicit db dependency, got %v", deps)
+	}
+}
+
+func loadComposeFile(t *testing.T, content string) kobject.KomposeObject {
+	t.Helper()
+	composeFile, err := os.CreateTemp(t.TempDir(), "compose-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := composeFile.WriteString(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := composeFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := Compose{}
+	komposeObject, err := c.LoadFile([]string{composeFile.Name()}, nil, true)
+	if err != nil {
+		t.Fatalf("LoadFile failed: %v", err)
+	}
+	return komposeObject
+}
+
+func TestLoadDependsOn(t *testing.T) {
+	komposeObject := loadComposeFile(t, `
+services:
+  app:
+    image: nginx
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+        required: false
+      mig:
+        condition: service_completed_successfully
+  db:
+    image: postgres
+  cache:
+    image: redis
+  mig:
+    image: migrate
+`)
+
+	svc, ok := komposeObject.ServiceConfigs["app"]
+	if !ok {
+		t.Fatalf("Expected service app, got keys: %v", getKeys(komposeObject.ServiceConfigs))
+	}
+	if len(svc.DependsOn) != 3 {
+		t.Fatalf("Expected 3 dependencies, got %d", len(svc.DependsOn))
+	}
+	expected := []kobject.ServiceDependency{
+		{Name: "cache", Condition: "service_started", Required: false},
+		{Name: "db", Condition: "service_healthy", Required: true},
+		{Name: "mig", Condition: "service_completed_successfully", Required: true},
+	}
+	if !reflect.DeepEqual(svc.DependsOn, expected) {
+		t.Errorf("Dependencies are not equal, expected: %v, output: %v", expected, svc.DependsOn)
+	}
+}
+
+func TestLoadDependsOnShortSyntax(t *testing.T) {
+	komposeObject := loadComposeFile(t, `
+services:
+  app:
+    image: nginx
+    depends_on:
+      - db
+  db:
+    image: postgres
+`)
+
+	svc := komposeObject.ServiceConfigs["app"]
+	expected := []kobject.ServiceDependency{
+		{Name: "db", Condition: "service_started", Required: true},
+	}
+	if !reflect.DeepEqual(svc.DependsOn, expected) {
+		t.Errorf("Dependencies are not equal, expected: %v, output: %v", expected, svc.DependsOn)
+	}
+}
+
+func TestLoadRestartOnFailureWithRetries(t *testing.T) {
+	komposeObject := loadComposeFile(t, `
+services:
+  app:
+    image: nginx
+    restart: "on-failure:5"
+`)
+
+	svc := komposeObject.ServiceConfigs["app"]
+	if svc.Restart != "on-failure" {
+		t.Errorf("Expected restart on-failure, got %q", svc.Restart)
+	}
+	if svc.RestartMaxRetries != 5 {
+		t.Errorf("Expected restart max retries 5, got %d", svc.RestartMaxRetries)
+	}
+}
+
+func TestLoadDeployRestartPolicy(t *testing.T) {
+	komposeObject := loadComposeFile(t, `
+services:
+  app:
+    image: nginx
+    restart: "no"
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+`)
+
+	svc := komposeObject.ServiceConfigs["app"]
+	// deploy.restart_policy.condition overrides restart
+	if svc.Restart != "on-failure" {
+		t.Errorf("Expected restart on-failure, got %q", svc.Restart)
+	}
+	// max_attempts is reported as ignored and must not leak into the retry count
+	if svc.RestartMaxRetries != 0 {
+		t.Errorf("Expected restart max retries 0, got %d", svc.RestartMaxRetries)
 	}
 }

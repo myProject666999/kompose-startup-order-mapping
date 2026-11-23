@@ -276,6 +276,8 @@ spec:
           livenessProbe:
             exec:
               command:
+                - sh
+                - -c
                 - echo "liveness"
             failureThreshold: 5
             periodSeconds: 10

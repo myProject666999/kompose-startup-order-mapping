@@ -89,6 +89,8 @@ spec:
           livenessProbe:
             exec:
               command:
+                - sh
+                - -c
                 - echo "hello world"
             failureThreshold: 5
             periodSeconds: 10
